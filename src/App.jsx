@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import L from "leaflet";
 import * as turf from "@turf/turf";
+import logo from "./midl-logo.png";
 
 const KEY = import.meta.env.VITE_GEOAPIFY_KEY;
 const API = "https://api.geoapify.com/v1";
@@ -356,7 +357,7 @@ export default function App() {
   return (
     <div className="app">
       <aside className="panel">
-        <h1>Midl</h1>
+        <h1 className="brand"><img src={logo} alt="Midl" /></h1>
         <p className="lede">Find a restaurant that's a fair trip for everyone.</p>
 
         <form onSubmit={(e) => { e.preventDefault(); run(people); }}>

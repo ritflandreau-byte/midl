@@ -13,6 +13,8 @@ html, body, #root { height: 100%; margin: 0; }
 .app { display: grid; grid-template-columns: 360px 1fr; height: 100%; }
 .panel { background: var(--bg); padding: 28px 24px; overflow-y: auto; border-right: 1px solid var(--line); }
 h1 { margin: 0 0 6px; font-size: 26px; font-weight: 600; letter-spacing: -0.02em; }
+.brand { margin: 0 0 10px; line-height: 0; }
+.brand img { display: block; width: 150px; height: auto; mix-blend-mode: multiply; }
 .lede { margin: 0 0 22px; color: var(--muted); line-height: 1.5; }
 form { display: flex; flex-direction: column; gap: 14px; }
 label { display: flex; flex-direction: column; gap: 6px; font-weight: 500; font-size: 14px; }
