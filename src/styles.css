@@ -77,12 +77,27 @@ input[type="range"] { accent-color: var(--accent); }
 .dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; flex: none; }
 .map { height: 100%; }
 
+/* address suggestions */
+.ac { position: relative; }
+.ac-list { position: absolute; z-index: 30; top: calc(100% + 4px); left: 0; right: 0; margin: 0; padding: 4px; list-style: none; background: #fff; border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 8px 24px rgba(23, 33, 43, 0.14); max-height: 240px; overflow-y: auto; }
+.ac-list li { padding: 9px 10px; border-radius: 6px; font-size: 14px; line-height: 1.35; cursor: pointer; }
+.ac-list li.on, .ac-list li:hover { background: var(--bg); }
+
+/* restaurant details */
+.food li .hrs { color: var(--ink); }
+.site { display: inline-block; margin: -2px 12px 10px; font-size: 12px; font-weight: 500; color: var(--ink); text-underline-offset: 2px; }
+.tip { max-width: 230px; white-space: normal; font-size: 13px; line-height: 1.45; }
+.tip strong { display: block; font-weight: 600; }
+.tip a { color: var(--ink); font-weight: 500; }
+
 @media (max-width: 760px) {
   .app { grid-template-columns: 1fr; grid-template-rows: 42vh 1fr; height: 100vh; height: 100dvh; }
   .map { order: -1; }
   .panel { border-right: 0; border-top: 1px solid var(--line); padding: 18px 16px 32px; }
   .food ul { max-height: none; }
   .chip, .modes button, .pick, .link { min-height: 40px; }
+  .ac-list li { padding: 12px 10px; }
+  .site { padding: 6px 0; }
 }
 @media (prefers-reduced-motion: reduce) {
   .leaflet-fade-anim * { transition: none !important; }

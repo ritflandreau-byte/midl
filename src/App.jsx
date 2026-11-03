@@ -22,7 +22,7 @@ const DIETS = [
 ];
 
 const letter = (i) => String.fromCharCode(65 + i);
-const blank = () => ({ text: "", mode: "drive", minutes: 30 });
+const blank = () => ({ text: "", mode: "drive", minutes: 30, pt: null });
 const style = (color, fill) => ({ color, weight: 2, fillColor: color, fillOpacity: fill });
 
 /* ---------- shareable link ---------- */
@@ -37,6 +37,7 @@ function initialPeople() {
           text: String(text || ""),
           mode: MODES.some((m) => m.id === mode) ? mode : "drive",
           minutes: Math.min(60, Math.max(5, Number(minutes) || 30)),
+          pt: null,
         }));
       if (list.length >= 2) return list;
     }
@@ -66,14 +67,15 @@ function dayMatch(spec, d) {
   return false;
 }
 
-// true = open, false = closed, null = hours missing or not understood
-function openNow(str, now = new Date()) {
-  if (!str) return null;
-  if (str.trim() === "24/7") return true;
+// open: true / false / null (hours missing or not understood); today: hours text for today
+function hoursInfo(str, now = new Date()) {
+  if (!str) return { open: null, today: null };
+  if (str.trim() === "24/7") return { open: true, today: "24 hours" };
   const d = now.getDay();
   const t = now.getHours() * 60 + now.getMinutes();
   let parsed = false;
   let state = false;
+  let today = null;
   for (const rule of str.split(";")) {
     const m = rule.trim().match(RULE);
     if (!m) continue;
@@ -81,8 +83,10 @@ function openNow(str, now = new Date()) {
     if (!dayMatch(m[1], d)) continue;
     if (/^(off|closed)$/i.test(m[2])) {
       state = false;
+      today = "Closed";
       continue;
     }
+    today = m[2].split(",").map((r) => r.trim().replace(/-/g, "–")).join(", ");
     state = m[2].split(",").some((range) => {
       const [s, e] = range.trim().split("-").map((x) => {
         const [h, mm = 0] = x.split(":").map(Number);
@@ -91,7 +95,59 @@ function openNow(str, now = new Date()) {
       return e > s ? t >= s && t < e : t >= s || t < e;
     });
   }
-  return parsed ? state : null;
+  return parsed ? { open: state, today } : { open: null, today: null };
+}
+
+/* ---------- safe text, links and pin cards (place data is untrusted) ---------- */
+
+function el(tag, text, cls) {
+  const n = document.createElement(tag);
+  if (text != null) n.textContent = text;
+  if (cls) n.className = cls;
+  return n;
+}
+
+function safeUrl(u) {
+  if (!u) return null;
+  try {
+    const url = new URL(/^https?:\/\//i.test(u) ? u : `https://${u}`);
+    return /^https?:$/.test(url.protocol) ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
+function hoursLine(r) {
+  if (r.open === true) return r.today ? `Open now · ${r.today}` : "Open now";
+  if (r.open === false) return r.today === "Closed" ? "Closed today" : r.today ? `Closed now · today ${r.today}` : "Closed now";
+  return r.hoursRaw ? `Hours: ${r.hoursRaw.length > 70 ? r.hoursRaw.slice(0, 70) + "…" : r.hoursRaw}` : "Hours not listed";
+}
+
+function tooltipEl(r) {
+  const box = el("div", null, "tip");
+  box.append(el("strong", r.name));
+  if (r.cuisine) box.append(el("div", r.cuisine));
+  box.append(el("div", hoursLine(r)));
+  return box;
+}
+
+function popupEl(r) {
+  const box = el("div", null, "tip");
+  box.append(el("strong", r.name));
+  const sub = [r.cuisine, r.address].filter(Boolean).join(" · ");
+  if (sub) box.append(el("div", sub));
+  box.append(el("div", hoursLine(r)));
+  if (r.max != null) box.append(el("div", r.times.map((t, i) => `${letter(i)} ${t} min`).join(" · ")));
+  if (r.website) {
+    const link = el("a", "Visit website");
+    link.href = r.website;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    box.append(link);
+  } else {
+    box.append(el("div", "No website listed"));
+  }
+  return box;
 }
 
 /* ---------- Geoapify calls ---------- */
@@ -104,6 +160,18 @@ async function geocode(text) {
   const hit = data.features?.[0];
   if (!hit) throw new Error(`Couldn't find "${text}". Try adding a city or state.`);
   return { lng: hit.geometry.coordinates[0], lat: hit.geometry.coordinates[1], label: hit.properties.formatted };
+}
+
+async function suggest(text, near) {
+  const url = `${API}/geocode/autocomplete?text=${encodeURIComponent(text)}&limit=5&bias=proximity:${near.lng},${near.lat}&apiKey=${KEY}`;
+  const res = await fetch(url);
+  if (!res.ok) return [];
+  const data = await res.json();
+  return (data.features || []).map((f) => ({
+    label: f.properties.formatted,
+    lng: f.geometry.coordinates[0],
+    lat: f.geometry.coordinates[1],
+  }));
 }
 
 async function isochrone(point, mode, minutes) {
@@ -140,7 +208,9 @@ async function fetchRestaurants(overlap) {
         lat: f.geometry.coordinates[1],
         lng: f.geometry.coordinates[0],
         diets: Object.fromEntries(DIETS.map(([k]) => [k, yes(diet[k]) || yes(raw[`diet:${k}`])])),
-        open: openNow(p.opening_hours || raw.opening_hours),
+        ...hoursInfo(p.opening_hours || raw.opening_hours),
+        hoursRaw: p.opening_hours || raw.opening_hours || "",
+        website: safeUrl(p.website || p.contact?.website || raw.website || raw["contact:website"]),
       };
     });
 }
@@ -166,6 +236,96 @@ async function travelTimes(person, point, targets) {
     });
   }
   return out;
+}
+
+/* ---------- address field with suggestions ---------- */
+
+function AddressInput({ id, value, label, near, onText, onPick }) {
+  const [items, setItems] = useState([]);
+  const [open, setOpen] = useState(false);
+  const [active, setActive] = useState(-1);
+  const seq = useRef(0);
+  const timer = useRef(null);
+
+  useEffect(() => () => clearTimeout(timer.current), []);
+
+  function change(e) {
+    const text = e.target.value;
+    onText(text);
+    clearTimeout(timer.current);
+    const mine = ++seq.current;
+    if (text.trim().length < 3) {
+      setItems([]);
+      setOpen(false);
+      return;
+    }
+    timer.current = setTimeout(async () => {
+      try {
+        const list = await suggest(text, near());
+        if (mine === seq.current) {
+          setItems(list);
+          setActive(-1);
+          setOpen(list.length > 0);
+        }
+      } catch {
+        /* suggestions are optional; typing still works */
+      }
+    }, 250);
+  }
+
+  function choose(item) {
+    seq.current++;
+    clearTimeout(timer.current);
+    onPick(item);
+    setItems([]);
+    setOpen(false);
+  }
+
+  function onKey(e) {
+    if (!open) return;
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setActive((i) => (i + 1) % items.length);
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setActive((i) => (i <= 0 ? items.length - 1 : i - 1));
+    } else if (e.key === "Enter" && active >= 0) {
+      e.preventDefault();
+      choose(items[active]);
+    } else if (e.key === "Escape") {
+      setOpen(false);
+    }
+  }
+
+  return (
+    <div className="ac">
+      <input
+        id={id}
+        role="combobox"
+        aria-expanded={open}
+        aria-controls={`${id}-list`}
+        aria-autocomplete="list"
+        aria-activedescendant={active >= 0 ? `${id}-o${active}` : undefined}
+        autoComplete="off"
+        value={value}
+        onChange={change}
+        onKeyDown={onKey}
+        onBlur={() => setOpen(false)}
+        placeholder="Start typing an address or city"
+        aria-label={label}
+      />
+      {open && (
+        <ul className="ac-list" id={`${id}-list`} role="listbox">
+          {items.map((it, i) => (
+            <li key={i} id={`${id}-o${i}`} role="option" aria-selected={i === active} className={i === active ? "on" : ""}
+              onMouseDown={(e) => { e.preventDefault(); choose(it); }}>
+              {it.label}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
 }
 
 /* ---------- app ---------- */
@@ -230,7 +390,13 @@ export default function App() {
 
   function select(r) {
     setSelected(r.id);
-    map.current.flyTo([r.lat, r.lng], Math.max(map.current.getZoom(), 14));
+    const m = map.current;
+    if (m.getZoom() >= 14 && m.getCenter().distanceTo([r.lat, r.lng]) < 30) {
+      markers.current[r.id]?.openPopup();
+      return;
+    }
+    m.flyTo([r.lat, r.lng], Math.max(m.getZoom(), 14));
+    m.once("moveend", () => markers.current[r.id]?.openPopup());
   }
 
   // Redraw restaurant pins whenever the filtered list changes.
@@ -243,8 +409,10 @@ export default function App() {
       markers.current[r.id] = L.circleMarker([r.lat, r.lng], {
         radius: 6, color: "#fff", weight: 1.5, fillColor: "#B8423A", fillOpacity: 1,
       })
-        .bindTooltip(r.cuisine ? `${r.name} (${r.cuisine})` : r.name)
-        .on("click", () => select(r))
+        .bindTooltip(tooltipEl(r), { direction: "top", offset: [0, -6] })
+        .bindPopup(popupEl(r), { maxWidth: 260 })
+        .on("click", () => setSelected(r.id))
+        .on("popupopen", (e) => e.target.closeTooltip())
         .addTo(group);
     });
   }, [visible]);
@@ -255,10 +423,7 @@ export default function App() {
       m.setStyle(+id === selected ? { radius: 10, color: "#17212b", weight: 3 } : { radius: 6, color: "#fff", weight: 1.5 })
     );
     const m = markers.current[selected];
-    if (m) {
-      m.bringToFront();
-      m.openTooltip();
-    }
+    if (m) m.bringToFront();
   }, [selected, visible]);
 
   async function run(list) {
@@ -267,7 +432,7 @@ export default function App() {
       return setStatus({ kind: "error", message: "Fill in every location, or remove the empty ones." });
     setStatus({ kind: "loading" });
     try {
-      const pts = await Promise.all(list.map((p) => geocode(p.text)));
+      const pts = await Promise.all(list.map((p) => (p.pt ? Promise.resolve(p.pt) : geocode(p.text))));
       const zones = await Promise.all(list.map((p, i) => isochrone(pts[i], p.mode, p.minutes)));
       const overlap = zones.slice(1).reduce((acc, z) => (acc ? turf.intersect(acc, z) : null), zones[0]);
 
@@ -283,7 +448,7 @@ export default function App() {
       if (overlap) L.geoJSON(overlap, { style: style(BOTH, 0.5) }).addTo(layer.current);
       pts.forEach((p, i) =>
         L.circleMarker([p.lat, p.lng], { radius: 8, color: "#fff", weight: 2, fillColor: COLORS[i], fillOpacity: 1 })
-          .bindTooltip(`${letter(i)}: ${p.label}`)
+          .bindTooltip(el("span", `${letter(i)}: ${p.label}`))
           .addTo(layer.current)
       );
       const bounds = zones.reduce((b, z) => b.extend(L.geoJSON(z).getBounds()), L.geoJSON(zones[0]).getBounds());
@@ -370,8 +535,10 @@ export default function App() {
                     onClick={() => setPeople((ps) => ps.filter((_, j) => j !== i))}>×</button>
                 )}
               </div>
-              <input value={p.text} onChange={(e) => setPerson(i, { text: e.target.value })}
-                placeholder="Street address or city" aria-label={`Location for person ${letter(i)}`} />
+              <AddressInput id={`addr-${i}`} value={p.text} label={`Location for person ${letter(i)}`}
+                near={() => map.current.getCenter()}
+                onText={(text) => setPerson(i, { text, pt: null })}
+                onPick={(it) => setPerson(i, { text: it.label, pt: it })} />
               <div className="modes" role="group" aria-label={`Travel mode for person ${letter(i)}`}>
                 {MODES.map((m) => (
                   <button type="button" key={m.id} className={p.mode === m.id ? "on" : ""} onClick={() => setPerson(i, { mode: m.id })}>
@@ -441,7 +608,9 @@ export default function App() {
                         </span>
                       )}
                       <span>{[r.cuisine, r.address].filter(Boolean).join(" · ")}</span>
+                      <span className="hrs">{hoursLine(r)}</span>
                     </button>
+                    {r.website && <a className="site" href={r.website} target="_blank" rel="noopener noreferrer">Website</a>}
                   </li>
                 ))}
               </ul>
