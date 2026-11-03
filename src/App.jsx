@@ -67,6 +67,14 @@ function dayMatch(spec, d) {
   return false;
 }
 
+function fmt12(t) {
+  const [h, m = "00"] = t.trim().split(":");
+  const hr = Number(h);
+  const suffix = hr >= 12 && hr < 24 ? "PM" : "AM";
+  return `${hr % 12 === 0 ? 12 : hr % 12}${m === "00" ? "" : ":" + m} ${suffix}`;
+}
+const to12 = (s) => s.replace(/\b(\d{1,2}):(\d{2})\b/g, (_, h, m) => fmt12(`${h}:${m}`));
+
 // open: true / false / null (hours missing or not understood); today: hours text for today
 function hoursInfo(str, now = new Date()) {
   if (!str) return { open: null, today: null };
@@ -86,7 +94,7 @@ function hoursInfo(str, now = new Date()) {
       today = "Closed";
       continue;
     }
-    today = m[2].split(",").map((r) => r.trim().replace(/-/g, "–")).join(", ");
+    today = m[2].split(",").map((r) => (/^0?0:00-24:00$/.test(r.trim()) ? "24 hours" : r.trim().split("-").map(fmt12).join(" – "))).join(", ");
     state = m[2].split(",").some((range) => {
       const [s, e] = range.trim().split("-").map((x) => {
         const [h, mm = 0] = x.split(":").map(Number);
@@ -117,10 +125,22 @@ function safeUrl(u) {
   }
 }
 
+const GENERIC = new Set(["the", "and", "restaurant", "restaurants", "grill", "grille", "kitchen", "cafe", "bar", "house", "pizza", "pizzeria", "bistro", "tavern", "pub", "diner", "eatery", "food", "foods", "bbq", "steakhouse", "sushi", "thai", "chinese", "italian", "mexican", "indian"]);
+
+// Keep a listed website only if its domain looks like the restaurant's name.
+function matchSite(url, name) {
+  if (!url) return null;
+  const host = new URL(url).hostname.replace(/^www\./, "").split(".").slice(0, -1).join("").replace(/[^a-z0-9]/g, "");
+  const tokens = name.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").split(/[^a-z0-9]+/).filter((t) => t.length >= 3 && !GENERIC.has(t));
+  return tokens.some((t) => host.includes(t)) ? url : null;
+}
+
+const mapsUrl = (name, address) => `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent([name, address].filter(Boolean).join(" "))}`;
+
 function hoursLine(r) {
   if (r.open === true) return r.today ? `Open now · ${r.today}` : "Open now";
   if (r.open === false) return r.today === "Closed" ? "Closed today" : r.today ? `Closed now · today ${r.today}` : "Closed now";
-  return r.hoursRaw ? `Hours: ${r.hoursRaw.length > 70 ? r.hoursRaw.slice(0, 70) + "…" : r.hoursRaw}` : "Hours not listed";
+  return r.hoursRaw ? `Hours: ${to12(r.hoursRaw.length > 70 ? r.hoursRaw.slice(0, 70) + "…" : r.hoursRaw)}` : "Hours not listed";
 }
 
 function tooltipEl(r) {
@@ -131,22 +151,25 @@ function tooltipEl(r) {
   return box;
 }
 
+function linkEl(text, href) {
+  const link = el("a", text);
+  link.href = href;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  return link;
+}
+
 function popupEl(r) {
-  const box = el("div", null, "tip");
+  const box = el("div", null, "tip pop");
   box.append(el("strong", r.name));
   const sub = [r.cuisine, r.address].filter(Boolean).join(" · ");
   if (sub) box.append(el("div", sub));
   box.append(el("div", hoursLine(r)));
   if (r.max != null) box.append(el("div", r.times.map((t, i) => `${letter(i)} ${t} min`).join(" · ")));
-  if (r.website) {
-    const link = el("a", "Visit website");
-    link.href = r.website;
-    link.target = "_blank";
-    link.rel = "noopener noreferrer";
-    box.append(link);
-  } else {
-    box.append(el("div", "No website listed"));
-  }
+  const links = el("div", null, "pop-links");
+  if (r.website) links.append(linkEl("Website", r.website));
+  links.append(linkEl("Google Maps", r.maps));
+  box.append(links);
   return box;
 }
 
@@ -204,13 +227,14 @@ async function fetchRestaurants(overlap) {
       return {
         name: p.name,
         address: p.address_line2 || "",
-        cuisine: cuisine.split(";")[0].replace(/_/g, " "),
+        cuisine: cuisine.split(";")[0].replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()),
         lat: f.geometry.coordinates[1],
         lng: f.geometry.coordinates[0],
         diets: Object.fromEntries(DIETS.map(([k]) => [k, yes(diet[k]) || yes(raw[`diet:${k}`])])),
         ...hoursInfo(p.opening_hours || raw.opening_hours),
         hoursRaw: p.opening_hours || raw.opening_hours || "",
-        website: safeUrl(p.website || p.contact?.website || raw.website || raw["contact:website"]),
+        website: matchSite(safeUrl(p.website || p.contact?.website || raw.website || raw["contact:website"]), p.name),
+        maps: mapsUrl(p.name, p.address_line2),
       };
     });
 }
@@ -410,7 +434,7 @@ export default function App() {
         radius: 6, color: "#fff", weight: 1.5, fillColor: "#B8423A", fillOpacity: 1,
       })
         .bindTooltip(tooltipEl(r), { direction: "top", offset: [0, -6] })
-        .bindPopup(popupEl(r), { maxWidth: 260 })
+        .bindPopup(popupEl(r), { minWidth: 260, maxWidth: 380 })
         .on("click", () => setSelected(r.id))
         .on("popupopen", (e) => e.target.closeTooltip())
         .addTo(group);
@@ -523,7 +547,7 @@ export default function App() {
     <div className="app">
       <aside className="panel">
         <h1 className="brand"><img src={logo} alt="Midl" /></h1>
-        <p className="lede">meet me in the midl.</p>
+        <p className="lede">Find a restaurant that's a fair trip for everyone.</p>
 
         <form onSubmit={(e) => { e.preventDefault(); run(people); }}>
           {people.map((p, i) => (
@@ -610,7 +634,10 @@ export default function App() {
                       <span>{[r.cuisine, r.address].filter(Boolean).join(" · ")}</span>
                       <span className="hrs">{hoursLine(r)}</span>
                     </button>
-                    {r.website && <a className="site" href={r.website} target="_blank" rel="noopener noreferrer">Website</a>}
+                    <div className="links">
+                      {r.website && <a className="site" href={r.website} target="_blank" rel="noopener noreferrer">Website</a>}
+                      <a className="site" href={r.maps} target="_blank" rel="noopener noreferrer">Google Maps</a>
+                    </div>
                   </li>
                 ))}
               </ul>
