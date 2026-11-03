@@ -1,15 +1,99 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import L from "leaflet";
 import * as turf from "@turf/turf";
 
 const KEY = import.meta.env.VITE_GEOAPIFY_KEY;
 const API = "https://api.geoapify.com/v1";
-const COLORS = { a: "#2B6CB0", b: "#D9822B", both: "#1F9D6B" };
+const COLORS = ["#2B6CB0", "#D9822B", "#7B4FB5", "#C2347F", "#2A8C99"];
+const BOTH = "#1F9D6B";
+const MAX_PEOPLE = 5;
+const MAX_CANDIDATES = 60; // restaurants closest to the middle that get exact travel times
 const MODES = [
   { id: "drive", label: "Drive" },
   { id: "bicycle", label: "Bike" },
   { id: "walk", label: "Walk" },
 ];
+const DIETS = [
+  ["vegetarian", "Vegetarian"],
+  ["vegan", "Vegan"],
+  ["gluten_free", "Gluten-free"],
+  ["halal", "Halal"],
+];
+
+const letter = (i) => String.fromCharCode(65 + i);
+const blank = () => ({ text: "", mode: "drive", minutes: 30 });
+const style = (color, fill) => ({ color, weight: 2, fillColor: color, fillOpacity: fill });
+
+/* ---------- shareable link ---------- */
+
+function initialPeople() {
+  try {
+    const s = new URLSearchParams(window.location.search).get("s");
+    if (s) {
+      const list = JSON.parse(s)
+        .slice(0, MAX_PEOPLE)
+        .map(([text, mode, minutes]) => ({
+          text: String(text || ""),
+          mode: MODES.some((m) => m.id === mode) ? mode : "drive",
+          minutes: Math.min(60, Math.max(5, Number(minutes) || 30)),
+        }));
+      if (list.length >= 2) return list;
+    }
+  } catch {
+    /* fall through to blank form */
+  }
+  return [blank(), blank()];
+}
+
+/* ---------- opening hours (handles the common OSM formats) ---------- */
+
+const DAYS = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
+const RULE = /^(?:([A-Za-z][A-Za-z,\- ]*?)\s+)?(off|closed|\d[\d:,\-\s+]*)$/i;
+
+function dayMatch(spec, d) {
+  if (!spec) return true;
+  for (const tok of spec.split(",").map((s) => s.trim())) {
+    if (tok.includes("-")) {
+      const [a, b] = tok.split("-").map((s) => DAYS.indexOf(s.trim()));
+      if (a < 0 || b < 0) continue;
+      for (let i = a; ; i = (i + 1) % 7) {
+        if (i === d) return true;
+        if (i === b) break;
+      }
+    } else if (DAYS.indexOf(tok) === d) return true;
+  }
+  return false;
+}
+
+// true = open, false = closed, null = hours missing or not understood
+function openNow(str, now = new Date()) {
+  if (!str) return null;
+  if (str.trim() === "24/7") return true;
+  const d = now.getDay();
+  const t = now.getHours() * 60 + now.getMinutes();
+  let parsed = false;
+  let state = false;
+  for (const rule of str.split(";")) {
+    const m = rule.trim().match(RULE);
+    if (!m) continue;
+    parsed = true;
+    if (!dayMatch(m[1], d)) continue;
+    if (/^(off|closed)$/i.test(m[2])) {
+      state = false;
+      continue;
+    }
+    state = m[2].split(",").some((range) => {
+      const [s, e] = range.trim().split("-").map((x) => {
+        const [h, mm = 0] = x.split(":").map(Number);
+        return h * 60 + mm;
+      });
+      return e > s ? t >= s && t < e : t >= s || t < e;
+    });
+  }
+  return parsed ? state : null;
+}
+
+/* ---------- Geoapify calls ---------- */
 
 async function geocode(text) {
   const url = `${API}/geocode/search?text=${encodeURIComponent(text)}&limit=1&apiKey=${KEY}`;
@@ -29,6 +113,8 @@ async function isochrone(point, mode, minutes) {
   return data.features[0];
 }
 
+const yes = (v) => v === true || v === "yes" || v === "only";
+
 async function fetchRestaurants(overlap) {
   const [minX, minY, maxX, maxY] = turf.bbox(overlap);
   const c = turf.centroid(overlap).geometry.coordinates;
@@ -42,30 +128,66 @@ async function fetchRestaurants(overlap) {
   return (data.features || [])
     .filter((f) => f.properties.name && turf.booleanPointInPolygon(f.geometry, overlap))
     .map((f) => {
-      const cuisine = f.properties.catering?.cuisine || f.properties.datasource?.raw?.cuisine || "";
+      const p = f.properties;
+      const raw = p.datasource?.raw || {};
+      const cuisine = p.catering?.cuisine || raw.cuisine || "";
+      const diet = p.catering?.diet || {};
       return {
-        name: f.properties.name,
-        address: f.properties.address_line2 || "",
+        name: p.name,
+        address: p.address_line2 || "",
         cuisine: cuisine.split(";")[0].replace(/_/g, " "),
         lat: f.geometry.coordinates[1],
         lng: f.geometry.coordinates[0],
+        diets: Object.fromEntries(DIETS.map(([k]) => [k, yes(diet[k]) || yes(raw[`diet:${k}`])])),
+        open: openNow(p.opening_hours || raw.opening_hours),
       };
     });
 }
 
+// Minutes from one person to each target, in small batches to stay under request limits.
+async function travelTimes(person, point, targets) {
+  const out = [];
+  for (let i = 0; i < targets.length; i += 30) {
+    const chunk = targets.slice(i, i + 30);
+    const res = await fetch(`${API}/routematrix?apiKey=${KEY}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        mode: person.mode,
+        sources: [{ location: [point.lng, point.lat] }],
+        targets: chunk.map((t) => ({ location: [t.lng, t.lat] })),
+      }),
+    });
+    if (!res.ok) throw new Error(`Exact travel times unavailable (error ${res.status}).`);
+    const data = await res.json();
+    (data.sources_to_targets?.[0] || []).forEach((cell) => {
+      out[i + cell.target_index] = cell.time != null ? Math.round(cell.time / 60) : null;
+    });
+  }
+  return out;
+}
+
+/* ---------- app ---------- */
+
 export default function App() {
-  const [a, setA] = useState("");
-  const [b, setB] = useState("");
-  const [minutes, setMinutes] = useState(30);
-  const [mode, setMode] = useState("drive");
+  const [people, setPeople] = useState(initialPeople);
+  const [roster, setRoster] = useState([]);
   const [status, setStatus] = useState({ kind: "idle" });
+  const [scored, setScored] = useState([]);
+  const [foodNote, setFoodNote] = useState("");
+  const [showFood, setShowFood] = useState(true);
+  const [cuisine, setCuisine] = useState("");
+  const [diets, setDiets] = useState([]);
+  const [openOnly, setOpenOnly] = useState(false);
+  const [selected, setSelected] = useState(null);
+  const [pickN, setPickN] = useState(0);
+  const [copied, setCopied] = useState(false);
+
   const mapEl = useRef(null);
   const map = useRef(null);
   const layer = useRef(null);
   const foodLayer = useRef(null);
-  const [restaurants, setRestaurants] = useState([]);
-  const [foodNote, setFoodNote] = useState("");
-  const [showFood, setShowFood] = useState(true);
+  const markers = useRef({});
 
   useEffect(() => {
     map.current = L.map(mapEl.current).setView([42.75, -71.4], 8);
@@ -77,114 +199,261 @@ export default function App() {
     return () => map.current.remove();
   }, []);
 
+  // Opening a shared link runs the search straight away.
+  useEffect(() => {
+    if (new URLSearchParams(window.location.search).get("s")) run(people);
+  }, []);
+
   useEffect(() => {
     if (!map.current || !foodLayer.current) return;
     if (showFood) map.current.addLayer(foodLayer.current);
     else map.current.removeLayer(foodLayer.current);
   }, [showFood]);
 
-  async function run(e) {
-    e.preventDefault();
+  const cuisines = useMemo(() => [...new Set(scored.map((r) => r.cuisine).filter(Boolean))].sort(), [scored]);
+
+  const visible = useMemo(
+    () =>
+      scored
+        .filter(
+          (r) =>
+            (!cuisine || r.cuisine === cuisine) &&
+            diets.every((k) => r.diets[k]) &&
+            (!openOnly || r.open === true)
+        )
+        .sort((x, y) => x.score - y.score),
+    [scored, cuisine, diets, openOnly]
+  );
+
+  const hiddenNoHours = openOnly ? scored.filter((r) => r.open === null).length : 0;
+
+  function select(r) {
+    setSelected(r.id);
+    map.current.flyTo([r.lat, r.lng], Math.max(map.current.getZoom(), 14));
+  }
+
+  // Redraw restaurant pins whenever the filtered list changes.
+  useEffect(() => {
+    const group = foodLayer.current;
+    if (!group) return;
+    group.clearLayers();
+    markers.current = {};
+    visible.forEach((r) => {
+      markers.current[r.id] = L.circleMarker([r.lat, r.lng], {
+        radius: 6, color: "#fff", weight: 1.5, fillColor: "#B8423A", fillOpacity: 1,
+      })
+        .bindTooltip(r.cuisine ? `${r.name} (${r.cuisine})` : r.name)
+        .on("click", () => select(r))
+        .addTo(group);
+    });
+  }, [visible]);
+
+  // Enlarge the selected pin.
+  useEffect(() => {
+    Object.entries(markers.current).forEach(([id, m]) =>
+      m.setStyle(+id === selected ? { radius: 10, color: "#17212b", weight: 3 } : { radius: 6, color: "#fff", weight: 1.5 })
+    );
+    const m = markers.current[selected];
+    if (m) {
+      m.bringToFront();
+      m.openTooltip();
+    }
+  }, [selected, visible]);
+
+  async function run(list) {
     if (!KEY) return setStatus({ kind: "error", message: "Missing API key. Add VITE_GEOAPIFY_KEY to your .env file." });
-    if (!a.trim() || !b.trim()) return setStatus({ kind: "error", message: "Enter both locations." });
+    if (list.some((p) => !p.text.trim()))
+      return setStatus({ kind: "error", message: "Fill in every location, or remove the empty ones." });
     setStatus({ kind: "loading" });
     try {
-      const [pa, pb] = await Promise.all([geocode(a), geocode(b)]);
-      const [za, zb] = await Promise.all([isochrone(pa, mode, minutes), isochrone(pb, mode, minutes)]);
-      const overlap = turf.intersect(za, zb);
+      const pts = await Promise.all(list.map((p) => geocode(p.text)));
+      const zones = await Promise.all(list.map((p, i) => isochrone(pts[i], p.mode, p.minutes)));
+      const overlap = zones.slice(1).reduce((acc, z) => (acc ? turf.intersect(acc, z) : null), zones[0]);
 
       layer.current.clearLayers();
       foodLayer.current.clearLayers();
-      setRestaurants([]);
+      setScored([]);
       setFoodNote("");
-      const style = (color, fill) => ({ color, weight: 2, fillColor: color, fillOpacity: fill });
-      L.geoJSON(za, { style: style(COLORS.a, 0.12) }).addTo(layer.current);
-      L.geoJSON(zb, { style: style(COLORS.b, 0.12) }).addTo(layer.current);
-      if (overlap) L.geoJSON(overlap, { style: style(COLORS.both, 0.5) }).addTo(layer.current);
-      [[pa, COLORS.a, "A"], [pb, COLORS.b, "B"]].forEach(([p, c, n]) =>
-        L.circleMarker([p.lat, p.lng], { radius: 8, color: "#fff", weight: 2, fillColor: c, fillOpacity: 1 })
-          .bindTooltip(`${n}: ${p.label}`)
+      setSelected(null);
+      setPickN(0);
+      setRoster(list);
+
+      zones.forEach((z, i) => L.geoJSON(z, { style: style(COLORS[i], 0.12) }).addTo(layer.current));
+      if (overlap) L.geoJSON(overlap, { style: style(BOTH, 0.5) }).addTo(layer.current);
+      pts.forEach((p, i) =>
+        L.circleMarker([p.lat, p.lng], { radius: 8, color: "#fff", weight: 2, fillColor: COLORS[i], fillOpacity: 1 })
+          .bindTooltip(`${letter(i)}: ${p.label}`)
           .addTo(layer.current)
       );
-      const bounds = L.geoJSON(za).getBounds().extend(L.geoJSON(zb).getBounds());
+      const bounds = zones.reduce((b, z) => b.extend(L.geoJSON(z).getBounds()), L.geoJSON(zones[0]).getBounds());
       map.current.fitBounds(bounds, { padding: [30, 30] });
 
-      if (overlap) {
-        try {
-          const food = await fetchRestaurants(overlap);
-          food.forEach((r) =>
-            L.circleMarker([r.lat, r.lng], { radius: 5, color: "#fff", weight: 1, fillColor: "#B8423A", fillOpacity: 1 })
-              .bindTooltip(r.cuisine ? `${r.name} (${r.cuisine})` : r.name)
-              .addTo(foodLayer.current)
-          );
-          setRestaurants(food);
-          if (food.length === 0) setFoodNote("No restaurants found inside the overlap area.");
-        } catch (err) {
-          setFoodNote(err.message);
-        }
-        const sqMi = turf.area(overlap) / 2589988.11;
-        setStatus({ kind: "ok", message: `Overlap found: about ${Math.round(sqMi).toLocaleString()} sq mi where you're each within ${minutes} min.` });
-      } else {
-        setStatus({ kind: "none", message: `No overlap at ${minutes} min. Try a longer time.` });
+      window.history.replaceState(null, "", `?s=${encodeURIComponent(JSON.stringify(list.map((p) => [p.text, p.mode, p.minutes])))}`);
+
+      if (!overlap) {
+        setStatus({ kind: "none", message: `No area where everyone is within their time limit. Try longer times.` });
+        return;
       }
+
+      try {
+        const found = await fetchRestaurants(overlap);
+        const mid = turf.centroid(overlap);
+        const cands = found
+          .map((r) => ({ ...r, d: turf.distance(mid, turf.point([r.lng, r.lat])) }))
+          .sort((x, y) => x.d - y.d)
+          .slice(0, MAX_CANDIDATES)
+          .map((r, i) => ({ ...r, id: i }));
+
+        let cols = null;
+        try {
+          cols = await Promise.all(list.map((p, i) => travelTimes(p, pts[i], cands)));
+        } catch (err) {
+          setFoodNote(`${err.message} Showing the places nearest the middle instead.`);
+        }
+
+        setScored(
+          cands.map((r) => {
+            const times = cols ? cols.map((col) => col[r.id]) : [];
+            const ok = times.length > 0 && times.every((t) => t != null);
+            const max = ok ? Math.max(...times) : null;
+            const spread = ok ? max - Math.min(...times) : null;
+            return { ...r, times, max, spread, score: ok ? max + spread * 0.5 : 1000 + r.d };
+          })
+        );
+        if (cands.length === 0) setFoodNote("No restaurants found inside the overlap area.");
+      } catch (err) {
+        setFoodNote(err.message);
+      }
+
+      const sqMi = turf.area(overlap) / 2589988.11;
+      setStatus({ kind: "ok", message: `Overlap found: about ${Math.round(sqMi).toLocaleString()} sq mi where everyone is within their time limit.` });
     } catch (err) {
       setStatus({ kind: "error", message: err.message });
     }
   }
 
+  const setPerson = (i, patch) => setPeople((ps) => ps.map((p, j) => (j === i ? { ...p, ...patch } : p)));
+  const toggleDiet = (k) => setDiets((d) => (d.includes(k) ? d.filter((x) => x !== k) : [...d, k]));
+
+  function pick() {
+    if (!visible.length) return;
+    select(visible[pickN % Math.min(3, visible.length)]);
+    setPickN((n) => n + 1);
+  }
+
+  async function copyLink() {
+    try {
+      await navigator.clipboard.writeText(window.location.href);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1800);
+    } catch {
+      setFoodNote("Couldn't copy automatically. Copy the link from your address bar instead.");
+    }
+  }
+
+  const ranked = visible.length > 0 && visible[0].times.length > 0 && visible[0].max != null;
+
   return (
     <div className="app">
       <aside className="panel">
         <h1>Midl</h1>
-        <p className="lede">Find where two people can meet or live within a set travel time of both.</p>
-        <form onSubmit={run}>
-          <label>
-            <span><i className="dot" style={{ background: COLORS.a }} /> Location A</span>
-            <input value={a} onChange={(e) => setA(e.target.value)} placeholder="Street address or city" />
-          </label>
-          <label>
-            <span><i className="dot" style={{ background: COLORS.b }} /> Location B</span>
-            <input value={b} onChange={(e) => setB(e.target.value)} placeholder="Street address or city" />
-          </label>
-          <label>
-            <span>Max travel time: {minutes} min</span>
-            <input type="range" min="5" max="60" step="5" value={minutes} onChange={(e) => setMinutes(+e.target.value)} />
-          </label>
-          <div className="modes" role="group" aria-label="Travel mode">
-            {MODES.map((m) => (
-              <button type="button" key={m.id} className={mode === m.id ? "on" : ""} onClick={() => setMode(m.id)}>
-                {m.label}
-              </button>
-            ))}
-          </div>
+        <p className="lede">Find a restaurant that's a fair trip for everyone.</p>
+
+        <form onSubmit={(e) => { e.preventDefault(); run(people); }}>
+          {people.map((p, i) => (
+            <div className="person" key={i}>
+              <div className="person-head">
+                <span><i className="dot" style={{ background: COLORS[i] }} /> Person {letter(i)}</span>
+                {people.length > 2 && (
+                  <button type="button" className="x" aria-label={`Remove person ${letter(i)}`}
+                    onClick={() => setPeople((ps) => ps.filter((_, j) => j !== i))}>×</button>
+                )}
+              </div>
+              <input value={p.text} onChange={(e) => setPerson(i, { text: e.target.value })}
+                placeholder="Street address or city" aria-label={`Location for person ${letter(i)}`} />
+              <div className="modes" role="group" aria-label={`Travel mode for person ${letter(i)}`}>
+                {MODES.map((m) => (
+                  <button type="button" key={m.id} className={p.mode === m.id ? "on" : ""} onClick={() => setPerson(i, { mode: m.id })}>
+                    {m.label}
+                  </button>
+                ))}
+              </div>
+              <label className="time">
+                <span>Up to {p.minutes} min</span>
+                <input type="range" min="5" max="60" step="5" value={p.minutes} onChange={(e) => setPerson(i, { minutes: +e.target.value })} />
+              </label>
+            </div>
+          ))}
+          {people.length < MAX_PEOPLE && (
+            <button type="button" className="add" onClick={() => setPeople((ps) => [...ps, blank()])}>+ Add a person</button>
+          )}
           <button className="go" disabled={status.kind === "loading"}>
-            {status.kind === "loading" ? "Finding overlap…" : "Find overlap"}
+            {status.kind === "loading" ? "Finding restaurants…" : "Find restaurants"}
           </button>
         </form>
+
         {status.message && <p className={`msg ${status.kind}`}>{status.message}</p>}
+        {status.kind === "ok" && (
+          <button type="button" className="link" onClick={copyLink}>{copied ? "Link copied" : "Copy share link"}</button>
+        )}
         {foodNote && <p className="msg none">{foodNote}</p>}
-        {restaurants.length > 0 && (
+
+        {scored.length > 0 && (
           <section className="food">
-            <label className="check">
-              <input type="checkbox" checked={showFood} onChange={(e) => setShowFood(e.target.checked)} />
-              Show restaurants on map ({restaurants.length} in overlap)
-            </label>
-            <ul>
-              {restaurants.slice(0, 25).map((r, i) => (
-                <li key={i}>
-                  <button type="button" onClick={() => map.current.flyTo([r.lat, r.lng], 15)}>
-                    <strong>{r.name}</strong>
-                    <span>{[r.cuisine, r.address].filter(Boolean).join(" · ")}</span>
-                  </button>
-                </li>
-              ))}
-            </ul>
+            <div className="filters">
+              <select value={cuisine} onChange={(e) => setCuisine(e.target.value)} aria-label="Cuisine">
+                <option value="">Any cuisine</option>
+                {cuisines.map((c) => <option key={c} value={c}>{c}</option>)}
+              </select>
+              <div className="chips" role="group" aria-label="Filters">
+                <button type="button" className={openOnly ? "chip on" : "chip"} aria-pressed={openOnly} onClick={() => setOpenOnly((v) => !v)}>Open now</button>
+                {DIETS.map(([k, label]) => (
+                  <button type="button" key={k} className={diets.includes(k) ? "chip on" : "chip"} aria-pressed={diets.includes(k)} onClick={() => toggleDiet(k)}>{label}</button>
+                ))}
+              </div>
+              {(openOnly || diets.length > 0) && (
+                <p className="hint">Hours and diet tags come from OpenStreetMap, so places without them are hidden when these are on{hiddenNoHours ? ` (${hiddenNoHours} have no listed hours)` : ""}.</p>
+              )}
+            </div>
+
+            <div className="food-head">
+              <label className="check">
+                <input type="checkbox" checked={showFood} onChange={(e) => setShowFood(e.target.checked)} />
+                Show on map ({visible.length})
+              </label>
+              <button type="button" className="pick" onClick={pick} disabled={!visible.length}>Pick for us</button>
+            </div>
+
+            {visible.length === 0 ? (
+              <p className="msg none">No restaurants match these filters. Turn one off to see more.</p>
+            ) : (
+              <ul>
+                {visible.slice(0, 40).map((r, i) => (
+                  <li key={r.id} className={r.id === selected ? "sel" : ""}>
+                    <button type="button" onClick={() => select(r)}>
+                      <strong>{r.name}{ranked && i === 0 && <em className="badge">Fairest</em>}</strong>
+                      {r.times.length > 0 && r.max != null && (
+                        <span className="times">
+                          {r.times.map((t, j) => (
+                            <span key={j} className="t"><i className="dot" style={{ background: COLORS[j] }} />{letter(j)} {t} min</span>
+                          ))}
+                        </span>
+                      )}
+                      <span>{[r.cuisine, r.address].filter(Boolean).join(" · ")}</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+            {ranked && <p className="hint">Sorted by the longest trip anyone makes, then by how even the trips are. Times use each person's own travel mode.</p>}
           </section>
         )}
+
         <ul className="legend">
-          <li><i className="dot" style={{ background: COLORS.a }} /> Reachable from A</li>
-          <li><i className="dot" style={{ background: COLORS.b }} /> Reachable from B</li>
-          <li><i className="dot" style={{ background: COLORS.both }} /> Reachable from both</li>
+          {roster.map((p, i) => (
+            <li key={i}><i className="dot" style={{ background: COLORS[i] }} /> Reachable from {letter(i)}</li>
+          ))}
+          <li><i className="dot" style={{ background: BOTH }} /> Reachable from everyone</li>
           <li><i className="dot" style={{ background: "#B8423A" }} /> Restaurant</li>
         </ul>
       </aside>
