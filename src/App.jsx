@@ -523,7 +523,7 @@ export default function App() {
     <div className="app">
       <aside className="panel">
         <h1 className="brand"><img src={logo} alt="Midl" /></h1>
-        <p className="lede">Meet in the midl.</p>
+        <p className="lede">meet me in the midl.</p>
 
         <form onSubmit={(e) => { e.preventDefault(); run(people); }}>
           {people.map((p, i) => (
