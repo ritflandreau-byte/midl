@@ -591,7 +591,7 @@ export default function App() {
             {theme === "dark" ? "Light mode" : "Dark mode"}
           </button>
         </div>
-        <p className="lede">Find a restaurant that's a fair trip for everyone.</p>
+        <p className="lede">let's meet in the midl</p>
 
         <form onSubmit={(e) => { e.preventDefault(); run(people); }}>
           {people.map((p, i) => (
