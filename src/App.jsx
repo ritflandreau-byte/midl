@@ -9,6 +9,9 @@ const COLORS = ["#2B6CB0", "#D9822B", "#7B4FB5", "#C2347F", "#2A8C99"];
 const BOTH = "#1F9D6B";
 const MAX_PEOPLE = 5;
 const MAX_MINUTES = 180;
+const ISO_LIMIT = 60; // Geoapify isolines allow at most 60 minutes; longer trips use a rough estimate
+// Rough straight-line speeds (mph) that allow for winding roads, used only for trips over 60 min.
+const EST_MPH = { drive: 40, bicycle: 9, walk: 2.8 };
 const MAX_CANDIDATES = 60; // restaurants closest to the middle that get exact travel times
 const MODES = [
   { id: "drive", label: "Drive" },
@@ -25,7 +28,7 @@ const DIETS = [
 const fmtMin = (m) => (m < 60 ? `${m} min` : m % 60 ? `${Math.floor(m / 60)} hr ${m % 60} min` : `${m / 60} hr`);
 const letter = (i) => String.fromCharCode(65 + i);
 const blank = () => ({ text: "", mode: "drive", minutes: 30, pt: null });
-const style = (color, fill) => ({ color, weight: 2, fillColor: color, fillOpacity: fill });
+const style = (color, fill, dashed) => ({ color, weight: 2, fillColor: color, fillOpacity: fill, dashArray: dashed ? "6 6" : undefined });
 
 /* ---------- shareable link ---------- */
 
@@ -197,6 +200,12 @@ async function suggest(text, near) {
     lng: f.geometry.coordinates[0],
     lat: f.geometry.coordinates[1],
   }));
+}
+
+// Rough circle for trips Geoapify can't calculate (over 60 minutes). Not road-accurate.
+function estimateZone(point, mode, minutes) {
+  const miles = (EST_MPH[mode] || 40) * (minutes / 60);
+  return turf.circle([point.lng, point.lat], miles, { steps: 72, units: "miles" });
 }
 
 async function isochrone(point, mode, minutes) {
@@ -459,7 +468,8 @@ export default function App() {
     setStatus({ kind: "loading" });
     try {
       const pts = await Promise.all(list.map((p) => (p.pt ? Promise.resolve(p.pt) : geocode(p.text))));
-      const zones = await Promise.all(list.map((p, i) => isochrone(pts[i], p.mode, p.minutes)));
+      const estimated = list.map((p) => p.minutes > ISO_LIMIT);
+      const zones = await Promise.all(list.map((p, i) => (estimated[i] ? estimateZone(pts[i], p.mode, p.minutes) : isochrone(pts[i], p.mode, p.minutes))));
       const overlap = zones.slice(1).reduce((acc, z) => (acc ? turf.intersect(acc, z) : null), zones[0]);
 
       layer.current.clearLayers();
@@ -470,7 +480,7 @@ export default function App() {
       setPickN(0);
       setRoster(list);
 
-      zones.forEach((z, i) => L.geoJSON(z, { style: style(COLORS[i], 0.12) }).addTo(layer.current));
+      zones.forEach((z, i) => L.geoJSON(z, { style: style(COLORS[i], 0.12, estimated[i]) }).addTo(layer.current));
       if (overlap) L.geoJSON(overlap, { style: style(BOTH, 0.5) }).addTo(layer.current);
       pts.forEach((p, i) =>
         L.circleMarker([p.lat, p.lng], { radius: 8, color: "#fff", weight: 2, fillColor: COLORS[i], fillOpacity: 1 })
@@ -503,8 +513,13 @@ export default function App() {
           setFoodNote(`${err.message} Showing the places nearest the middle instead.`);
         }
 
+        // Estimated areas are rough, so drop places whose real travel time is over someone's limit.
+        const finalCands = cols && estimated.some(Boolean)
+          ? cands.filter((r) => cols.every((col, i) => col[r.id] == null || col[r.id] <= list[i].minutes))
+          : cands;
+
         setScored(
-          cands.map((r) => {
+          finalCands.map((r) => {
             const times = cols ? cols.map((col) => col[r.id]) : [];
             const ok = times.length > 0 && times.every((t) => t != null);
             const max = ok ? Math.max(...times) : null;
@@ -512,13 +527,13 @@ export default function App() {
             return { ...r, times, max, spread, score: ok ? max + spread * 0.5 : 1000 + r.d };
           })
         );
-        if (cands.length === 0) setFoodNote("No restaurants found inside the overlap area.");
+        if (finalCands.length === 0) setFoodNote(cands.length === 0 ? "No restaurants found inside the overlap area." : "No restaurants are within everyone's time limit. Try longer times.");
       } catch (err) {
         setFoodNote(err.message);
       }
 
       const sqMi = turf.area(overlap) / 2589988.11;
-      setStatus({ kind: "ok", message: `Overlap found: about ${Math.round(sqMi).toLocaleString()} sq mi where everyone is within their time limit.` });
+      setStatus({ kind: "ok", message: `Overlap found: about ${Math.round(sqMi).toLocaleString()} sq mi where everyone is within their time limit.${estimated.some(Boolean) ? " Areas for trips over 1 hour are rough estimates, and restaurant times are checked individually." : ""}` });
     } catch (err) {
       setStatus({ kind: "error", message: err.message });
     }
@@ -573,7 +588,7 @@ export default function App() {
                 ))}
               </div>
               <label className="time">
-                <span>Up to {fmtMin(p.minutes)}</span>
+                <span>Up to {fmtMin(p.minutes)}{p.minutes > ISO_LIMIT ? " (estimated area)" : ""}</span>
                 <input type="range" min="5" max={MAX_MINUTES} step="5" value={p.minutes} onChange={(e) => setPerson(i, { minutes: +e.target.value })} />
               </label>
             </div>
