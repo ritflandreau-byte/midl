@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import L from "leaflet";
 import * as turf from "@turf/turf";
 import logo from "./midl-logo.png";
+import logoDark from "./midl-logo-dark.png";
 
 const KEY = import.meta.env.VITE_GEOAPIFY_KEY;
 const API = "https://api.geoapify.com/v1";
@@ -378,6 +379,24 @@ export default function App() {
   const [selected, setSelected] = useState(null);
   const [pickN, setPickN] = useState(0);
   const [copied, setCopied] = useState(false);
+  const [theme, setTheme] = useState(() => {
+    try {
+      const saved = localStorage.getItem("midl-theme");
+      if (saved === "dark" || saved === "light") return saved;
+    } catch {
+      /* storage can be blocked; fall back to the device setting */
+    }
+    return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  });
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    try {
+      localStorage.setItem("midl-theme", theme);
+    } catch {
+      /* not saving is fine */
+    }
+  }, [theme]);
 
   const mapEl = useRef(null);
   const map = useRef(null);
@@ -455,11 +474,11 @@ export default function App() {
   // Enlarge the selected pin.
   useEffect(() => {
     Object.entries(markers.current).forEach(([id, m]) =>
-      m.setStyle(+id === selected ? { radius: 10, color: "#17212b", weight: 3 } : { radius: 6, color: "#fff", weight: 1.5 })
+      m.setStyle(+id === selected ? { radius: 10, color: theme === "dark" ? "#ffd24a" : "#17212b", weight: 3 } : { radius: 6, color: "#fff", weight: 1.5 })
     );
     const m = markers.current[selected];
     if (m) m.bringToFront();
-  }, [selected, visible]);
+  }, [selected, visible, theme]);
 
   async function run(list) {
     if (!KEY) return setStatus({ kind: "error", message: "Missing API key. Add VITE_GEOAPIFY_KEY to your .env file." });
@@ -563,7 +582,15 @@ export default function App() {
   return (
     <div className="app">
       <aside className="panel">
-        <h1 className="brand"><img src={logo} alt="Midl" /></h1>
+        <div className="top">
+          <h1 className="brand">
+            <img className="logo-light" src={logo} alt="Midl" />
+            <img className="logo-dark" src={logoDark} alt="" aria-hidden="true" />
+          </h1>
+          <button type="button" className="theme" aria-pressed={theme === "dark"} onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}>
+            {theme === "dark" ? "Light mode" : "Dark mode"}
+          </button>
+        </div>
         <p className="lede">Find a restaurant that's a fair trip for everyone.</p>
 
         <form onSubmit={(e) => { e.preventDefault(); run(people); }}>
