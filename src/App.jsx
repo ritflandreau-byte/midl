@@ -547,7 +547,7 @@ export default function App() {
     <div className="app">
       <aside className="panel">
         <h1 className="brand"><img src={logo} alt="Midl" /></h1>
-        <p className="lede">Find a restaurant that's a fair trip for everyone.</p>
+        <p className="lede">let's meet in the midl</p>
 
         <form onSubmit={(e) => { e.preventDefault(); run(people); }}>
           {people.map((p, i) => (
