@@ -8,6 +8,7 @@ const API = "https://api.geoapify.com/v1";
 const COLORS = ["#2B6CB0", "#D9822B", "#7B4FB5", "#C2347F", "#2A8C99"];
 const BOTH = "#1F9D6B";
 const MAX_PEOPLE = 5;
+const MAX_MINUTES = 180;
 const MAX_CANDIDATES = 60; // restaurants closest to the middle that get exact travel times
 const MODES = [
   { id: "drive", label: "Drive" },
@@ -21,6 +22,7 @@ const DIETS = [
   ["halal", "Halal"],
 ];
 
+const fmtMin = (m) => (m < 60 ? `${m} min` : m % 60 ? `${Math.floor(m / 60)} hr ${m % 60} min` : `${m / 60} hr`);
 const letter = (i) => String.fromCharCode(65 + i);
 const blank = () => ({ text: "", mode: "drive", minutes: 30, pt: null });
 const style = (color, fill) => ({ color, weight: 2, fillColor: color, fillOpacity: fill });
@@ -36,7 +38,7 @@ function initialPeople() {
         .map(([text, mode, minutes]) => ({
           text: String(text || ""),
           mode: MODES.some((m) => m.id === mode) ? mode : "drive",
-          minutes: Math.min(60, Math.max(5, Number(minutes) || 30)),
+          minutes: Math.min(MAX_MINUTES, Math.max(5, Number(minutes) || 30)),
           pt: null,
         }));
       if (list.length >= 2) return list;
@@ -547,7 +549,7 @@ export default function App() {
     <div className="app">
       <aside className="panel">
         <h1 className="brand"><img src={logo} alt="Midl" /></h1>
-        <p className="lede">let's meet in the midl</p>
+        <p className="lede">Find a restaurant that's a fair trip for everyone.</p>
 
         <form onSubmit={(e) => { e.preventDefault(); run(people); }}>
           {people.map((p, i) => (
@@ -571,8 +573,8 @@ export default function App() {
                 ))}
               </div>
               <label className="time">
-                <span>Up to {p.minutes} min</span>
-                <input type="range" min="5" max="60" step="5" value={p.minutes} onChange={(e) => setPerson(i, { minutes: +e.target.value })} />
+                <span>Up to {fmtMin(p.minutes)}</span>
+                <input type="range" min="5" max={MAX_MINUTES} step="5" value={p.minutes} onChange={(e) => setPerson(i, { minutes: +e.target.value })} />
               </label>
             </div>
           ))}
